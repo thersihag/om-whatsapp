@@ -34,12 +34,20 @@ const upload = multer({ dest: 'uploads/' });
 // Structure: [sessionName] -> { sock, status, qr, logs: [], isSending: false }
 const sessions = new Map();
 
-// Helper to add structured logs
+// Helper to add structured logs with Indian Standard Time (IST - Asia/Kolkata)
 function addLog(sessionName, message, type = 'info') {
     const session = sessions.get(sessionName);
     if (!session) return;
     
-    const time = new Date().toLocaleTimeString();
+    // Force Indian timezone format (GMT +5:30)
+    const time = new Date().toLocaleTimeString('en-IN', {
+        timeZone: 'Asia/Kolkata',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+    });
+    
     session.logs.push({ time, message, type });
     
     // Limit logs to last 100 entries to optimize RAM
@@ -83,20 +91,41 @@ async function getOrInitSession(sessionName = 'default') {
     return sessionData;
 }
 
-// Spin up individual Baileys Connection
+// Spin up individual Baileys Connection with Cloud Enhancements
 async function startBaileys(sessionName) {
     const sessionPath = path.join(sessionsDir, sessionName);
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-    const { version } = await fetchLatestBaileysVersion();
+    
+    // Fallback WA Web version if the query endpoint fails on Railway network
+    let version = [2, 3000, 1017578294]; 
+    try {
+        const latest = await fetchLatestBaileysVersion();
+        if (latest && latest.version) {
+            version = latest.version;
+            addLog(sessionName, `Using WhatsApp Web engine version: ${version.join('.')}`, 'info');
+        }
+    } catch (versionError) {
+        addLog(sessionName, `Using stable offline fallback version: ${version.join('.')}`, 'warning');
+    }
 
     const sock = makeWASocket({
         version,
         auth: state,
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
-        keepAliveIntervalMs: 30000,
-        defaultQueryTimeoutMs: 60000,
-        connectTimeoutMs: 60000
+        
+        // Critical cloud server configurations:
+        connectTimeoutMs: 90000,      // Longer window to handle latency on server hosts
+        defaultQueryTimeoutMs: 90000,
+        keepAliveIntervalMs: 60000,   // Prevent standard TCP timeout drops
+        
+        // Mimic a standard desktop browser configuration to pass anti-bot firewalls
+        browser: ['Ubuntu', 'Chrome', '120.0.0.0'],
+        options: {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+        }
     });
 
     const sessionData = sessions.get(sessionName);
@@ -127,25 +156,31 @@ async function startBaileys(sessionName) {
 
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const errorReason = lastDisconnect?.error?.message || lastDisconnect?.error || 'Unknown network error';
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
             sessionData.status = 'DISCONNECTED';
             sessionData.phoneNumber = null;
 
+            addLog(sessionName, `Connection dropped. Detail: "${errorReason}" (Status Code: ${statusCode || 'Unknown'})`, 'warning');
+
             if (shouldReconnect) {
-                addLog(sessionName, `Connection dropped (${statusCode || 'Unknown'}). Reconnecting in 5s...`, 'warning');
+                addLog(sessionName, `Attempting automatic reconnection in 5s...`, 'info');
                 setTimeout(() => startBaileys(sessionName), 5000);
             } else {
-                addLog(sessionName, "Session forcefully logged out. Clearing local files. Please scan again.", 'error');
+                addLog(sessionName, "Session permanently logged out. Clearing stored credentials.", 'error');
                 sessions.delete(sessionName);
-                fs.rmSync(sessionPath, { recursive: true, force: true });
+                try {
+                    fs.rmSync(sessionPath, { recursive: true, force: true });
+                } catch (e) {
+                    addLog(sessionName, "Could not clean credentials folder automatically.", "warning");
+                }
             }
         }
     });
 
-    // Handle Incoming Messages (Optional Logging / Auto replies can be added here)
+    // Handle Incoming Messages safely
     sock.ev.on('messages.upsert', async (m) => {
-        // Just acknowledging message arrival in logs safely
         const msg = m.messages[0];
         if (!msg.key.fromMe && m.type === 'notify') {
             const sender = msg.key.remoteJid.split('@')[0];
