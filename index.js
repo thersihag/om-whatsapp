@@ -2,8 +2,8 @@ const express = require('express');
 const { 
     default: makeWASocket, 
     useMultiFileAuthState, 
-    DisconnectReason, 
-    fetchLatestBaileysVersion 
+    DisconnectReason,
+    Browsers
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
@@ -91,22 +91,42 @@ async function getOrInitSession(sessionName = 'default') {
     return sessionData;
 }
 
+// Clean corrupted credentials that can block connections on restart
+function cleanCorruptedCredentials(sessionPath) {
+    try {
+        const credsPath = path.join(sessionPath, 'creds.json');
+        if (fs.existsSync(credsPath)) {
+            const content = fs.readFileSync(credsPath, 'utf8');
+            if (!content || content.trim() === '' || content === '{}') {
+                fs.unlinkSync(credsPath);
+            } else {
+                // Ensure it is valid JSON
+                JSON.parse(content);
+            }
+        }
+    } catch (e) {
+        // If parsing fails or any other error, delete the corrupted folder structure
+        try {
+            fs.rmSync(sessionPath, { recursive: true, force: true });
+        } catch (rmError) {
+            // Ignore
+        }
+    }
+}
+
 // Spin up individual Baileys Connection with Cloud Enhancements
 async function startBaileys(sessionName) {
     const sessionPath = path.join(sessionsDir, sessionName);
+    
+    // Clean up any corrupted files from previous unexpected app terminations on Railway
+    cleanCorruptedCredentials(sessionPath);
+    
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
     
-    // Fallback WA Web version if the query endpoint fails on Railway network
-    let version = [2, 3000, 1017578294]; 
-    try {
-        const latest = await fetchLatestBaileysVersion();
-        if (latest && latest.version) {
-            version = latest.version;
-            addLog(sessionName, `Using WhatsApp Web engine version: ${version.join('.')}`, 'info');
-        }
-    } catch (versionError) {
-        addLog(sessionName, `Using stable offline fallback version: ${version.join('.')}`, 'warning');
-    }
+    // Statically define the absolute latest 2026 stable WhatsApp Web client version.
+    // This resolves the instant Disconnect drop / 405 error on Railway and VPS containers.
+    const version = [2, 3000, 1041540217]; 
+    addLog(sessionName, `Using stable WA version: ${version.join('.')}`, 'info');
 
     const sock = makeWASocket({
         version,
@@ -115,17 +135,12 @@ async function startBaileys(sessionName) {
         logger: pino({ level: 'silent' }),
         
         // Critical cloud server configurations:
-        connectTimeoutMs: 90000,      // Longer window to handle latency on server hosts
-        defaultQueryTimeoutMs: 90000,
-        keepAliveIntervalMs: 60000,   // Prevent standard TCP timeout drops
+        connectTimeoutMs: 120000,      // Increase handshake buffer to avoid cloud node network jitter
+        defaultQueryTimeoutMs: 120000,
+        keepAliveIntervalMs: 30000,   // Prevent Railway from closing inactive TCP channels
         
-        // Mimic a standard desktop browser configuration to pass anti-bot firewalls
-        browser: ['Ubuntu', 'Chrome', '120.0.0.0'],
-        options: {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            }
-        }
+        // Emulates a standard Safari desktop to prevent WhatsApp from blocking your cloud IP
+        browser: Browsers.macOS('Safari')
     });
 
     const sessionData = sessions.get(sessionName);
